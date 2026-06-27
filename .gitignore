@@ -1,0 +1,10 @@
+# original (pre-optimization) source models — the optimized versions live in models/
+models_src/
+
+# tooling / editor / OS
+.claude/
+node_modules/
+.DS_Store
+Thumbs.db
+*.log
+_stash/
