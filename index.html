@@ -123,6 +123,15 @@
   .promoBtn { font-size:42px; background:rgba(40,60,35,.6); border:1px solid rgba(200,170,90,.4); border-radius:12px; padding:6px 16px; cursor:pointer; color:#f4ead2; transition:all .15s; }
   .promoBtn:hover { background:rgba(120,150,70,.6); transform:scale(1.08); }
 
+  /* ---------- friend-match link modal ---------- */
+  #netLink {
+    font-family:monospace; font-size:12px; color:#ffe9a8; background:rgba(0,0,0,.35);
+    border:1px dashed rgba(200,170,90,.5); border-radius:8px; padding:10px 12px;
+    margin:4px auto 14px; word-break:break-all; max-width:340px;
+    user-select:text; -webkit-user-select:text;
+  }
+  #netStatus { font-style:italic; color:#9bb486; margin:14px 0 0; animation:pulse 1.6s infinite; }
+
   #toast {
     position:absolute; bottom:70px; left:50%; transform:translateX(-50%);
     font-family:'Cinzel',serif; font-size:14px; letter-spacing:.1em; color:#ffe9a8;
@@ -330,7 +339,7 @@
     <div class="lbl">OPPONENT</div>
     <div class="row" id="mRow">
       <button class="mbtn sel" data-m="ai">♟ vs Computer</button>
-      <button class="mbtn soon" data-m="local" disabled>👥 Two Players<small>coming soon</small></button>
+      <button class="mbtn" data-m="friend">🌐 Play a Friend<small>online — share a link</small></button>
     </div>
     <div class="lbl" id="dLbl">CPU STRENGTH</div>
     <div class="row" id="dRow">
@@ -374,6 +383,19 @@
     <h2 id="overTitle">Victory</h2>
     <p id="overSub"></p>
     <button id="againBtn" class="mbtn" style="font-size:17px;padding:12px 30px;">⚔ FIGHT AGAIN</button>
+  </div>
+</div>
+
+<div class="modal hidden" id="netModal">
+  <div class="box">
+    <h2 id="netTitle">Battle Link</h2>
+    <p id="netSub">Send this link to your friend — the battle begins when they arrive.</p>
+    <div id="netLink"></div>
+    <div class="row">
+      <button class="mbtn" id="netCopy">📋 Copy Link</button>
+      <button class="mbtn" id="netCancel">✕ Cancel</button>
+    </div>
+    <p id="netStatus">Waiting for opponent…</p>
   </div>
 </div>
 
@@ -2568,6 +2590,10 @@ if (IS_MOBILE) {
 let qualityName = IS_MOBILE ? 'low' : 'high';
 let board, turn, epTarget, mode = 'ai', gameOver = false, busy = false;
 let contextLost = false;
+/* friend-match (P2P) state */
+let myColor = 'w';                 // your side in a friend match
+let netRoom = null, netAct = null, netWaiting = false;
+let moveHistory = [];              // applied moves, for rejoin resync
 let pieces3d;                 // 8x8 of piece groups
 let selected = null;          // [f,r]
 let viewMode = 'classic';
@@ -2970,6 +2996,7 @@ function onPointerUp(e) {
   if (d.touch && performance.now() - d.t > 700) return;     // long press, not a tap
   if (busy || gameOver) return;
   if (mode === 'ai' && turn === 'b') return;
+  if (mode === 'friend' && (netWaiting || turn !== myColor)) return;   // online: only your own army
   ptr.x = (e.clientX / innerWidth) * 2 - 1;
   ptr.y = -(e.clientY / innerHeight) * 2 + 1;
   ray.setFromCamera(ptr, camera);
@@ -3014,6 +3041,13 @@ async function performMove(m) {
   /* promotion choice (human) before applying */
   if (mover.t === 'p' && (tr === 7 || tr === 0) && !m.promo) {
     m.promo = (mode === 'ai' && turn === 'b') ? 'q' : await askPromotion();
+  }
+
+  /* friend match: record every applied move; ship ours to the opponent */
+  moveHistory.push({ f: m.from, t: m.to, p: m.promo || null });
+  if (mode === 'friend' && !m.__remote && netAct) {
+    const ckAfter = timeControl ? Math.max(0, clocks[mover.c] + (timeControl.inc || 0)) : null;
+    netAct.sendMove({ f: m.from, t: m.to, p: m.promo || null, ck: ckAfter });
   }
 
   const res = E.apply(board, m);
@@ -3062,8 +3096,10 @@ async function performMove(m) {
   }
   attacker.userData.busy = false;
 
-  /* turn over — increment is added once your move is complete */
-  if (timeControl && timeControl.inc) clocks[mover.c] += timeControl.inc;
+  /* turn over — increment is added once your move is complete
+     (remote moves carry the sender's authoritative clock instead) */
+  if (m.__remote && m.__ck != null) clocks[mover.c] = m.__ck;
+  else if (timeControl && timeControl.inc) clocks[mover.c] += timeControl.inc;
   turn = turn === 'w' ? 'b' : 'w';
   updateTurnUI();
   updateClockUI();
@@ -3318,10 +3354,170 @@ async function setView(name) {
   });
 }
 
+/* ============================================================
+   FRIEND MATCH — serverless P2P over WebRTC (Trystero).
+   Signaling rides public Nostr relays; moves then flow directly
+   between the two browsers. No backend anywhere.
+   ============================================================ */
+/* MQTT strategy: public brokers proved far more reliable than Nostr relays in testing */
+const TRYSTERO_URL = 'https://cdn.jsdelivr.net/npm/@trystero-p2p/mqtt@0.25.2/+esm';
+const NET_APP = 'chess-battlefield-lakshya-v1';
+const roomFromHash = () => (location.hash.match(/room=([a-z0-9]+)/i) || [])[1] || null;
+
+function showNetModal(isHost) {
+  $('netTitle').textContent = isHost ? 'Battle Link' : 'Joining Battle';
+  $('netSub').textContent = isHost
+    ? 'Send this link to your friend — the battle begins when they arrive.'
+    : 'Connecting to your friend’s battle…';
+  $('netLink').textContent = location.href;
+  $('netLink').style.display = isHost ? 'block' : 'none';
+  $('netCopy').style.display = isHost ? '' : 'none';
+  $('netStatus').textContent = isHost ? 'Waiting for opponent…' : 'Searching the jungle…';
+  $('netModal').classList.remove('hidden');
+}
+
+async function netConnect() {
+  const existing = roomFromHash();
+  /* sessionStorage is per-tab: the creator keeps host status across a refresh,
+     but a friend's tab (even in the same browser) correctly joins as guest */
+  const isHost = !existing || sessionStorage.getItem('cb-host-' + existing) === '1';
+  const code = existing || Math.random().toString(36).slice(2, 8);
+  if (!existing) {
+    location.hash = 'room=' + code;
+    sessionStorage.setItem('cb-host-' + code, '1');
+  }
+  myColor = isHost ? 'w' : 'b';
+  netWaiting = true;
+  showNetModal(isHost);
+
+  const { joinRoom } = await import(TRYSTERO_URL);
+  if (!netWaiting) return;                          // cancelled while loading
+  netRoom = joinRoom({ appId: NET_APP }, code);
+  /* trystero v0.25: makeAction returns { send, onMessage } */
+  const actMove = netRoom.makeAction('move');
+  const actCfg  = netRoom.makeAction('cfg');
+  const actSync = netRoom.makeAction('sync');
+  const actCtl  = netRoom.makeAction('ctl');
+  const actHb   = netRoom.makeAction('hb');
+  netAct = { sendMove: actMove.send, sendCfg: actCfg.send, sendSync: actSync.send, sendCtl: actCtl.send };
+
+  /* application-level heartbeat: transport-level leave detection can lag
+     badly, so declare the opponent gone ourselves after 12s of silence. */
+  let lastSeen = 0, hbTimer = setInterval(() => {
+    if (!netRoom) { clearInterval(hbTimer); return; }
+    try { actHb.send(1); } catch (_) {}
+    if (lastSeen && !netWaiting && Date.now() - lastSeen > 12000) {
+      lastSeen = 0;
+      toast('⚠ Opponent disconnected');
+      if (!gameOver) $('status').textContent = 'Opponent disconnected — waiting for their return…';
+    }
+  }, 4000);
+  const seen = () => { lastSeen = Date.now(); if ($('status').textContent.startsWith('Opponent disconnected')) $('status').textContent = ''; };
+  actHb.onMessage = seen;
+
+  /* v0.25 API: handlers are assigned (setter properties), not called */
+  actMove.onMessage = mv => { seen(); applyRemoteMove(mv); };
+  actCfg.onMessage = c => {                         // host's settings reach the guest
+    seen();
+    if (isHost) return;
+    timeControl = c.tc ? { base: c.tc.base, inc: c.tc.inc } : null;
+    netBegin();
+  };
+  actSync.onMessage = s => { seen(); applySync(s); };
+  actCtl.onMessage = c => {
+    if (mode !== 'friend') return;
+    if (c.a === 'rematch') {
+      $('overModal').classList.add('hidden');
+      newGame();
+      toast('Rematch — the armies reform!');
+    }
+  };
+  netRoom.onPeerJoin = () => {
+    if (mode !== 'friend') return;
+    seen();
+    if (isHost) netAct.sendCfg({ tc: timeControl });
+    if (moveHistory.length) netAct.sendSync({ h: moveHistory, ck: { w: clocks.w, b: clocks.b }, tc: timeControl, over: gameOver });
+    if (netWaiting && isHost) netBegin();
+    if (!netWaiting) toast('Opponent reconnected');
+    $('status').textContent = '';
+  };
+  netRoom.onPeerLeave = () => {
+    if (mode !== 'friend' || netWaiting) return;
+    toast('⚠ Opponent disconnected');
+    if (!gameOver) $('status').textContent = 'Opponent disconnected — waiting for their return…';
+  };
+}
+function netBegin() {
+  if (!netWaiting) return;
+  netWaiting = false;
+  $('netModal').classList.add('hidden');
+  newGame();
+  toast(myColor === 'w'
+    ? 'Friend joined — you command the Ivory Legion'
+    : 'Connected — you command the Obsidian Horde');
+}
+function netLeave() {
+  const code = roomFromHash();
+  if (code) sessionStorage.removeItem('cb-host-' + code);
+  if (netRoom) { try { netRoom.leave(); } catch (_) {} }
+  netRoom = null; netAct = null; netWaiting = false;
+  if (code) history.replaceState(null, '', location.pathname + location.search);
+  $('netModal').classList.add('hidden');
+}
+
+/* opponent's move arrives — validate against our own engine, then play it */
+function applyRemoteMove(mv) {
+  if (mode !== 'friend' || gameOver || netWaiting) return;
+  if (turn === myColor) return;                     // not their turn — ignore
+  if (busy) { setTimeout(() => applyRemoteMove(mv), 250); return; }
+  const legal = E.legal(board, mv.f[0], mv.f[1], epTarget);
+  const m = legal.find(x => x.to[0] === mv.t[0] && x.to[1] === mv.t[1]);
+  if (!m) { toast('⚠ Board out of sync — move rejected'); return; }
+  if (mv.p) m.promo = mv.p;
+  m.__remote = true;
+  m.__ck = mv.ck;
+  performMove(m);
+}
+
+/* full-game resync after a refresh: replay history engine-only, respawn */
+function applySync(s) {
+  if (mode !== 'friend') return;
+  if (!netWaiting && s.h.length <= moveHistory.length) return;   // stale / older state
+  timeControl = s.tc ? { base: s.tc.base, inc: s.tc.inc } : null;
+  netWaiting = false;
+  $('netModal').classList.add('hidden');
+  gameId++;
+  board = E.newBoard(); turn = 'w'; epTarget = null;
+  gameOver = !!s.over; busy = false; selected = null; clearHL();
+  $('trayW').querySelectorAll('.cap').forEach(e => e.remove());
+  $('trayB').querySelectorAll('.cap').forEach(e => e.remove());
+  moveHistory = [];
+  for (const mv of s.h) {
+    const legal = E.legal(board, mv.f[0], mv.f[1], epTarget);
+    const m = legal.find(x => x.to[0] === mv.t[0] && x.to[1] === mv.t[1]);
+    if (!m) break;
+    if (mv.p) m.promo = mv.p;
+    const res = E.apply(board, m);
+    if (res.captured) addToTray(res.captured);
+    board = res.board;
+    epTarget = m.flag === 'double' ? [m.to[0], (m.from[1] + m.to[1]) / 2] : null;
+    turn = turn === 'w' ? 'b' : 'w';
+    moveHistory.push(mv);
+  }
+  if (timeControl && s.ck) { clocks.w = s.ck.w; clocks.b = s.ck.b; }
+  $('clkW').classList.toggle('hidden', !timeControl);
+  $('clkB').classList.toggle('hidden', !timeControl);
+  spawnPieces();
+  updateTurnUI(); updateClockUI();
+  $('status').textContent = E.inCheck(board, turn) ? '⚠ CHECK — the king is threatened!' : '';
+  toast('Battle resumed');
+}
+
 /* ---------------- game lifecycle ---------------- */
 function newGame() {
   gameId++;                       // invalidates any engine move still in flight
   board = E.newBoard();
+  moveHistory = [];
   turn = 'w'; epTarget = null; gameOver = false; busy = false;
   selected = null; clearHL();
   $('trayW').querySelectorAll('.cap').forEach(e => e.remove());
@@ -3346,8 +3542,8 @@ function loop() {
   const t = clock.elapsedTime;
   A.update(dt, t);
   V.update(t);
-  /* chess clock — pauses during battle animations */
-  if (timeControl && !gameOver && !busy) {
+  /* chess clock — pauses during battle animations and while waiting for a friend */
+  if (timeControl && !gameOver && !busy && !netWaiting) {
     clocks[turn] -= dt;
     if (clocks[turn] <= 0) { clocks[turn] = 0; flagFall(turn); }
     else updateClockUI();
@@ -3368,6 +3564,19 @@ function loop() {
   if ((fpsT += dt) > 0.5) { $('fpsTag').textContent = Math.round(fpsN / fpsAcc) + ' fps'; fpsAcc = 0; fpsN = 0; fpsT = 0; }
 }
 
+/* Background-tab pump: browsers pause requestAnimationFrame in hidden tabs,
+   which would freeze battle animations (and online moves) mid-flight and stop
+   the chess clock. Tick the essentials on a timer while hidden. */
+setInterval(() => {
+  if (!document.hidden || !renderer) return;
+  A.update(0.25, clock ? clock.elapsedTime : 0);
+  if (timeControl && !gameOver && !busy && !netWaiting) {
+    clocks[turn] -= 0.25;
+    if (clocks[turn] <= 0) { clocks[turn] = 0; flagFall(turn); }
+    else updateClockUI();
+  }
+}, 250);
+
 /* ---------------- UI wiring ---------------- */
 document.querySelectorAll('#qRow .qbtn').forEach(b => {
   b.onclick = () => {
@@ -3381,7 +3590,6 @@ if (IS_MOBILE) {   /* reflect the forced 'low' default on the title row and the 
   document.querySelectorAll('#qGroup .ctl').forEach(x => x.classList.toggle('sel', x.dataset.q === 'low'));
 }
 document.querySelectorAll('#mRow .mbtn').forEach(b => {
-  if (b.classList.contains('soon')) return;   // "coming soon" — not selectable
   b.onclick = () => {
     document.querySelectorAll('#mRow .mbtn').forEach(x => x.classList.remove('sel'));
     b.classList.add('sel');
@@ -3390,6 +3598,13 @@ document.querySelectorAll('#mRow .mbtn').forEach(b => {
     $('dRow').classList.toggle('hidden', mode !== 'ai');
   };
 });
+/* arriving via a friend's battle link: preselect the online mode */
+if (roomFromHash()) {
+  mode = 'friend';
+  document.querySelectorAll('#mRow .mbtn').forEach(x => x.classList.toggle('sel', x.dataset.m === 'friend'));
+  $('dLbl').classList.add('hidden'); $('dRow').classList.add('hidden');
+  $('loadNote').textContent = "Joining a friend's battle — pick your graphics and press PLAY";
+}
 document.querySelectorAll('#dRow .mbtn').forEach(b => {
   b.onclick = () => {
     document.querySelectorAll('#dRow .mbtn').forEach(x => x.classList.remove('sel'));
@@ -3447,7 +3662,15 @@ $('startBtn').onclick = () => {
       $('loader').classList.add('hidden');
       $('hud').classList.remove('hidden');
       sfx.play('select');
-      toast(toastLater || 'You command the Ivory Legion — the jungle commands the rest');
+      if (mode === 'friend') {
+        netConnect().catch(err => {
+          console.error(err);
+          toast('⚠ Could not reach the matchmaking relays — check your connection');
+          netLeave(); backToMenu();
+        });
+      } else {
+        toast(toastLater || 'You command the Ivory Legion — the jungle commands the rest');
+      }
     } catch (err) {
       $('loader').classList.add('hidden');
       $('loadNote').textContent = '⚠ ' + err.message;
@@ -3470,8 +3693,20 @@ $('sndBtn').onclick = () => {
   sfx.enabled = !sfx.enabled;
   $('sndBtn').textContent = sfx.enabled ? '🔊 Sound On' : '🔇 Sound Off';
 };
-$('newBtn').onclick = backToMenu;
-$('againBtn').onclick = backToMenu;
+$('newBtn').onclick = () => { if (!busy) { netLeave(); backToMenu(); } };
+$('againBtn').onclick = () => {
+  if (mode === 'friend' && netRoom && netAct) {      // online rematch, same colors
+    $('overModal').classList.add('hidden');
+    netAct.sendCtl({ a: 'rematch' });
+    newGame();
+    toast('Rematch — the armies reform!');
+  } else { netLeave(); backToMenu(); }
+};
+$('netCopy').onclick = async () => {
+  try { await navigator.clipboard.writeText(location.href); toast('Link copied — send it to your friend'); }
+  catch (_) { toast('Copy failed — long-press the link to copy it'); }
+};
+$('netCancel').onclick = () => { netLeave(); backToMenu(); };
 
 /* mobile controls: ⚙ hamburger opens a bottom sheet; tapping any control closes it */
 const ctlToggle = $('ctlToggle'), controlsEl = $('controls');
@@ -3499,7 +3734,7 @@ G.debugMove = (ff, fr, tf, tr) => {
   if (m) performMove({ ...m });
   return !!m;
 };
-G.debugState = () => ({ turn, busy, gameOver, pieces: G.livePieces.length });
+G.debugState = () => ({ turn, busy, gameOver, pieces: G.livePieces.length, mode, myColor, netWaiting, hist: moveHistory.length, peers: netRoom ? Object.keys(netRoom.getPeers()).length : 0 });
 /* visual test: make a white piece of `type` capture the nearest black piece */
 G.testKill = (type) => {
   const atk = G.livePieces.find(p => p.userData.type === type && p.userData.color === 'w');
