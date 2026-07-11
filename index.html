@@ -3362,6 +3362,14 @@ async function setView(name) {
 /* MQTT strategy: public brokers proved far more reliable than Nostr relays in testing */
 const TRYSTERO_URL = 'https://cdn.jsdelivr.net/npm/@trystero-p2p/mqtt@0.25.2/+esm';
 const NET_APP = 'chess-battlefield-lakshya-v1';
+/* explicit ICE servers — more STUN reach for NAT traversal + free public TURN
+   relays as a fallback for strict networks where a direct link can't form */
+const NET_RTC = { iceServers: [
+  { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] },
+  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+] };
 const roomFromHash = () => (location.hash.match(/room=([a-z0-9]+)/i) || [])[1] || null;
 
 function showNetModal(isHost) {
@@ -3392,7 +3400,16 @@ async function netConnect() {
 
   const { joinRoom } = await import(TRYSTERO_URL);
   if (!netWaiting) return;                          // cancelled while loading
-  netRoom = joinRoom({ appId: NET_APP }, code);
+  netRoom = joinRoom({ appId: NET_APP, rtcConfig: NET_RTC }, code);
+  /* if nothing connects in 22s, it's usually an ad-blocker or a strict network */
+  setTimeout(() => {
+    if (netWaiting && netRoom) {
+      $('netStatus').innerHTML = 'Still searching…<br><span style="font-size:11px;font-style:normal;opacity:.85">'
+        + 'Make sure your friend opened the link. If it keeps hanging, an <b>ad-blocker</b> '
+        + '(uBlock, Brave shields) or a strict work/VPN network can block the connection — '
+        + 'try disabling ad-blockers for this site, or a different network.</span>';
+    }
+  }, 22000);
   /* trystero v0.25: makeAction returns { send, onMessage } */
   const actMove = netRoom.makeAction('move');
   const actCfg  = netRoom.makeAction('cfg');
