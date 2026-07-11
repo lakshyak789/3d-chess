@@ -134,6 +134,14 @@ Three strengths: **Easy** (simple built-in AI, beatable), **Medium**
 (Stockfish skill 5), **Grandmaster** (full strength). If the engine can't
 load, the built-in AI takes over automatically.
 
+**Play a Friend (online, no server):** pick "Play a Friend", share the room
+link, and your friend's browser connects directly to yours over WebRTC
+(Trystero — signaling rides public MQTT brokers, moves flow peer-to-peer;
+there is no backend anywhere). Host plays Ivory, guest plays Obsidian. Both
+engines validate every move; kills, clocks and the checkmate execution stay
+in sync. Refreshing mid-game resyncs from the opponent, and either player
+can call an instant rematch.
+
 **Time controls:** Unlimited, 1+0 Bullet, 3+0 / 3+2 / 5+0 Blitz, 10+0 /
 15+10 Rapid, 30+0 Classical. Clocks flank the turn banner, the active side
 glows, under 20 seconds pulses red, and running out loses the game on time.
