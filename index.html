@@ -2497,6 +2497,13 @@ function actx() {
   if (sfx.ctx.state === 'suspended') sfx.ctx.resume();
   return sfx.ctx;
 }
+/* A programmatic click (the guest's auto-join) is NOT a user gesture, so the
+   browser keeps the AudioContext 'suspended' and the guest's match would run
+   silent. Resume it on their first genuine interaction; harmless no-op once
+   running, and it costs nothing for the host (who already pressed PLAY). */
+const unlockAudio = () => { if (sfx.ctx && sfx.ctx.state === 'suspended') sfx.ctx.resume(); };
+addEventListener('pointerdown', unlockAudio, { capture: true });
+addEventListener('keydown', unlockAudio, { capture: true });
 function noiseBuf(ctx, dur) {
   const b = ctx.createBuffer(1, ctx.sampleRate * dur, ctx.sampleRate);
   const d = b.getChannelData(0);
@@ -3337,6 +3344,15 @@ const VIEWS = {
   top:      { pos: [0, 33, 0.7],    tgt: [0, 0, 0] },
   battle:   { pos: [11.8, 3.0, 12.8], tgt: [0, 1.2, 0] },
 };
+/* The preset views are framed for White (near, +Z side). In a friend match the
+   guest commands the Obsidian army from the FAR side, so mirror the side-relative
+   presets 180° about the board centre — otherwise both players would stare down
+   the board from White's chair (which is exactly the bug being fixed). */
+function viewFor(name) {
+  const v = VIEWS[name];
+  if (!(mode === 'friend' && myColor === 'b')) return v;
+  return { pos: [-v.pos[0], v.pos[1], -v.pos[2]], tgt: [-v.tgt[0], v.tgt[1], -v.tgt[2]] };
+}
 async function setView(name) {
   viewMode = name;
   document.querySelectorAll('#viewGroup .ctl').forEach(b => b.classList.toggle('sel', b.dataset.view === name));
@@ -3345,7 +3361,7 @@ async function setView(name) {
     cinAngle = Math.atan2(camera.position.x, camera.position.z);
     return;
   }
-  const v = VIEWS[name];
+  const v = viewFor(name);
   const p0 = camera.position.clone(), t0 = controls.target.clone();
   const p1 = new THREE.Vector3(...v.pos), t1 = new THREE.Vector3(...v.tgt);
   await A.tw(0.9, k => {
@@ -3371,6 +3387,13 @@ const NET_RTC = { iceServers: [
   { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
 ] };
 const roomFromHash = () => (location.hash.match(/room=([a-z0-9]+)/i) || [])[1] || null;
+/* Who am I in this room? The creator (host) commands White; anyone opening the
+   link is Black. Derivable from the URL + per-tab host flag BEFORE the peer
+   connects, so the camera can face the right way from the very first frame. */
+const myNetColor = () => {
+  const rc = roomFromHash();
+  return (!rc || sessionStorage.getItem('cb-host-' + rc) === '1') ? 'w' : 'b';
+};
 
 function showNetModal(isHost) {
   $('netTitle').textContent = isHost ? 'Battle Link' : 'Joining Battle';
@@ -3446,6 +3469,7 @@ async function netConnect() {
     if (c.a === 'rematch') {
       $('overModal').classList.add('hidden');
       newGame();
+      setView('classic');   // clear the checkmate cinematic orbit + re-face each player's own side
       toast('Rematch — the armies reform!');
     }
   };
@@ -3615,12 +3639,18 @@ document.querySelectorAll('#mRow .mbtn').forEach(b => {
     $('dRow').classList.toggle('hidden', mode !== 'ai');
   };
 });
-/* arriving via a friend's battle link: preselect the online mode */
-if (roomFromHash()) {
+/* Arriving via a friend's battle link: skip the whole menu and drop straight into
+   the room — the host configures the match, the guest just joins. The mode is
+   preselected and the menu hidden up front; if the auto-join later fails, the
+   startBtn catch un-hides this menu (with friend mode already selected). */
+const joiningViaLink = !!roomFromHash();
+if (joiningViaLink) {
   mode = 'friend';
   document.querySelectorAll('#mRow .mbtn').forEach(x => x.classList.toggle('sel', x.dataset.m === 'friend'));
   $('dLbl').classList.add('hidden'); $('dRow').classList.add('hidden');
-  $('loadNote').textContent = "Joining a friend's battle — pick your graphics and press PLAY";
+  const lt = document.querySelector('#loader .ltxt');   // #loadNote lives inside #title (hidden below) — set the visible loader instead
+  if (lt) lt.textContent = "Joining your friend's battle…";
+  $('title').classList.add('hidden');
 }
 document.querySelectorAll('#dRow .mbtn').forEach(b => {
   b.onclick = () => {
@@ -3674,6 +3704,7 @@ $('startBtn').onclick = () => {
         applyQuality(qualityName, true);   // re-entry: rebuild env at the chosen quality
       }
       newGame();
+      myColor = (mode === 'friend') ? myNetColor() : 'w';   // face the board from your own army's side (AI/hot-seat = White)
       setView('classic');
       $('title').classList.add('hidden');
       $('loader').classList.add('hidden');
@@ -3690,11 +3721,16 @@ $('startBtn').onclick = () => {
       }
     } catch (err) {
       $('loader').classList.add('hidden');
+      $('title').classList.remove('hidden');   // re-show the menu so an auto-join error is visible
       $('loadNote').textContent = '⚠ ' + err.message;
       console.error(err);
     }
   }, 60);
 };
+/* now that the PLAY handler is wired, auto-join if we arrived via a battle link —
+   the guest goes straight to the "Joining Battle" flow, no menu to wade through */
+if (joiningViaLink) $('startBtn').click();
+
 /* return to the start menu (quality / opponent / strength / time can be re-picked) */
 function backToMenu() {
   if (busy) return;
@@ -3716,6 +3752,7 @@ $('againBtn').onclick = () => {
     $('overModal').classList.add('hidden');
     netAct.sendCtl({ a: 'rematch' });
     newGame();
+    setView('classic');   // clear the checkmate cinematic orbit + re-face each player's own side
     toast('Rematch — the armies reform!');
   } else { netLeave(); backToMenu(); }
 };
